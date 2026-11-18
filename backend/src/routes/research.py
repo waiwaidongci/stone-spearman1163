@@ -9,7 +9,7 @@ from src.schemas.observation import ObservationInput
 from src.schemas.run import RunInput
 from src.schemas.review import ReviewInput
 from src.controllers import research
-from src.services import runs,studies
+from src.services import runs,studies,guards
 from src.models.audit import Audit
 from src.models.observation import Observation
 from src.services.audits import log
@@ -33,6 +33,7 @@ def update(id:int,row_id:int,data:ObservationInput,db=Depends(get_db),user=Depen
 def remove(id:int,row_id:int,db=Depends(get_db),user=Depends(writer)):
     row=db.get(Observation,row_id)
     if not row or row.study_id!=id: raise HTTPException(404,'记录不存在')
+    if row.source_key in guards.blocked_keys(db,id): raise HTTPException(409,'该试件测值授权已撤回，禁止修改')
     db.delete(row);log(db,user,'observation.delete',row_id);db.commit();return {'deleted':True}
 @router.get('/runs')
 def list_runs(db=Depends(get_db),user=Depends(current_user)): return runs.list_runs(db)

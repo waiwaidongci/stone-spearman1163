@@ -5,44 +5,63 @@ from sqlalchemy import select
 from fastapi import HTTPException
 from src.models.run import Run
 from src.models.review import Review
+from src.models.purge import Purge
 from src.services import studies
 from src.services.domain_validation import validate_parameters
 from src.services.audits import log
+from src.services import guards
 from src.utils.serializers import record,now,checksum
 
 def create(db,data,user):
-    studies.require(db,data.study_id)
+    # Serialize with purge acceptance/execution on the batch row: a run either
+    # freezes before the withdrawal is accepted, or is refused afterwards.
+    # The batch row lock orders freezing against purge acceptance/execution; the
+    # snapshot is built from readable rows only, so untouched specimens stay usable
+    # while withdrawn ones can never be refrozen.
+    studies.require_locked(db,data.study_id)
     rows=studies.observations(db,data.study_id)
     if not rows: raise HTTPException(422,'先录入至少一条业务观测')
     try: params=validate_parameters(data.parameters)
     except (ValueError,TypeError) as e: raise HTTPException(422,str(e))
+    hidden=guards.blocked_keys(db,data.study_id)
+    if hidden.intersection(x['source_key'] for x in rows):
+        raise HTTPException(409,'观测包含已撤回测值，不能冻结')
     snapshot=[{'source_key':x['source_key'],'values':x['values']} for x in rows]
     run=Run(study_id=data.study_id,name=data.name,parameters=params,snapshot=snapshot,checksum=checksum(snapshot),created_at=now(),status='queued')
     db.add(run);db.flush();log(db,user,'run.queue',str(run.id));db.commit()
     Redis.from_url(os.environ['REDIS_URL']).rpush('analysis-queue',run.id)
     return record(run)
 
-def get(db,id):
+def get(db,id,strict=True):
     run=db.get(Run,id)
     if not run: raise HTTPException(404,'运行不存在')
+    if guards.should_block(db,run):
+        if strict: guards.assert_run_readable(db,run)
+        return guards.sanitized(run)
     result=record(run);review=db.scalar(select(Review).where(Review.run_id==id));result['review']=record(review) if review else None
     return result
 
 def list_runs(db):
-    return [get(db,x) for x in db.scalars(select(Run.id).order_by(Run.id.desc()))]
+    # Runs crossing an accepted withdrawal are listed as blocked tombstones with
+    # no values, snapshot or checksum, so historical research cannot leak originals.
+    return [get(db,run.id,strict=False) for run in db.scalars(select(Run).order_by(Run.id.desc()))]
 
 def approve(db,id,data,user):
     run=db.get(Run,id)
     if not run: raise HTTPException(404,'运行不存在')
+    guards.assert_run_readable(db,run)
     if run.status!='completed': raise HTTPException(409,'只能复核已完成运行')
     if db.scalar(select(Review).where(Review.run_id==id)): raise HTTPException(409,'已复核，记录不可覆盖')
+    if guards.contains_blocked(db,run.study_id,run.snapshot):
+        raise HTTPException(409,'该研究涉及被撤回测值，禁止复核')
     obj=Review(run_id=id,note=data.note,author=user.email,created_at=now());db.add(obj);log(db,user,'review.approve',f'{id}: {data.note}');db.commit();return record(obj)
 
 def export(db,id,user):
-    r=get(db,id)
+    r=get(db,id,strict=True)
+    if r.get('purged'): raise HTTPException(410,'该研究已执行数据清除，测值与结果文件不可恢复或下载')
     if r['status']!='completed': raise HTTPException(409,'尚无完成结果')
     if user.role=='viewer' and not r['review']: raise HTTPException(403,'观察员只能导出已复核结果')
     stream=io.StringIO();w=csv.writer(stream);w.writerow(['运行编号','输入校验SHA256','指标','值'])
     for k,v in r['result']['metrics'].items(): w.writerow([id,r['checksum'],k,json.dumps(v,ensure_ascii=False) if isinstance(v,(dict,list)) else v])
     w.writerow([id,r['checksum'],'解释',r['result']['interpretation']]);log(db,user,'run.export',id);db.commit()
-    return '\ufeff'+stream.getvalue()
+    return '﻿'+stream.getvalue()
